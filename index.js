@@ -1,6 +1,10 @@
 const { chromium } = require("playwright")
+const { pipe, asyncPipe, fold, Either, chain, map } = require("fpg")
+const AWS = require("aws-sdk")
+const dynamodb = new AWS.DynamoDB.DocumentClient({region: process.env.PRODUCTHUNT_REGION})
 
 
+const PRODUCTHUNT_SHIP_RANKING_DB = process.env.PRODUCTHUNT_SHIP_RANKING_DB
 
 const init = async (isHeadless = true) => {
   const browser = await chromium.launch({
@@ -63,6 +67,8 @@ const getItem = async (page, itemClass) =>
     const titleClass = "[class*='styles_title']"
     const taglineClass = "[class*='tagline']"
     const subClass = "[class*='subscriberCount']"
+    const linkClass = "[class*='styles_link']"
+    const imgClass = "[class*='styles_thumbnail']"
 
     const convertSubscribers = s =>
       Number(s.replace("subscribers", "").trim())
@@ -70,7 +76,9 @@ const getItem = async (page, itemClass) =>
     const title = (html.querySelector(titleClass) || {}).textContent
     const tagline = (html.querySelector(taglineClass) || {}).textContent
     const subscriberCount = ((html.querySelector(subClass) || {}).textContent || "0 subscribers")
-    return {title, tagline, subscriberCount: convertSubscribers(subscriberCount)}
+    const link = ((html.querySelector(linkClass) || {}).href || "https://")
+    const img = ((html.querySelector(imgClass) || {}).src || "https://")
+    return {title, tagline, link, img, subscriberCount: convertSubscribers(subscriberCount)}
 }))
 
 
@@ -96,31 +104,86 @@ async function autoScroll(page){
   });
 }
 
+	
 
-const addDate = xs => xs.map(x => ({...x, date: new Date().toISOString()}))
+
+const saveJson = data => {
+  const fs = require("fs")
+  fs.writeFile("./payload.json", JSON.stringify(data), "utf8", (e, ok) => e ? console.log("error", e) : console.log("saved"))
+}
+
+
+const addDate = xs => xs.map(x => ({...x, updateDate: new Date().toISOString()}))
+
+const removeNoTitle = data => data.filter(x => x.title)
+
+const hashCode = s => s.split('').reduce((a,b)=>{a=((a<<5)-a)+b.charCodeAt(0);return a&a},0)
+
+
+const createParams = data => ({
+  RequestItems: {
+    [PRODUCTHUNT_SHIP_RANKING_DB]: data.map(x => ({PutRequest: {Item: x}}))
+  }
+})
+
+const sliceIntoChunks = chunkSize => arr => {
+      const res = [];
+      for (let i = 0; i < arr.length; i += chunkSize) {
+                const chunk = arr.slice(i, i + chunkSize);
+                res.push(chunk);
+            }
+      return res;
+}
+
+const saveToDynamoDb = params =>
+  dynamodb.batchWrite(params).promise()
+
+const dedupList = xs => 
+        xs.filter((v, i, a) => a.findIndex(t => t.hash === v.hash) === i)
+
+const preprocess = asyncPipe([
+  addDate,
+  removeNoTitle,
+  Either.tryCatch(xs => xs.map(x => ({...x, hash: hashCode(x.title)}))),
+  map (dedupList),
+  map (sliceIntoChunks(25)),
+  map (xs => xs.map(createParams)),
+  map (xs => xs.map(saveToDynamoDb)),
+  fold (e => [], x => x)
+])
+
+const scrollBotton = async (page) =>
+  await page.evaluate(async () => {
+      const nodes = document.querySelectorAll("[class*='styles_item']:last-child")
+      const lastNode = (nodes || [])[0] 
+      lastNode ? lastNode.scrollIntoView() : void 7
+    })
+
+
+const scrollDown = async (page, j) => {
+    let i
+    for (i = 0; i < j; i++) {
+      console.log(`Scrolling #${i}`)
+      await page.waitForTimeout(3000)
+      await scrollBotton(page)
+    }
+    return "Success"
+}
 
 const handler = async(event) => {
   try {
     const { page, browser } = await init(true)
-    const ship = await goToShip("https://www.producthunt.com/upcoming?ref=header_nav", page)
-    await page.waitForTimeout(2000)
-    await autoScroll(page)
-    const item = "[class*='styles_item']"
-    const titleClass = "[class*='styles_title']"
-    const taglineClass = "[class*='tagline']"
-    const subClass = "[class*='subscriberCount']"
-    const ranking = await getItem(page, item)
-    const rankingWDates = addDate(ranking) 
-    console.log(rankingWDates)
-    //const titles = await getTitles(page, titleClass)
-    //const taglines = await getTaglines(page, taglineClass) 
-    //const subscribers = await getSubscribers(page, subClass) 
-    //const list = joinLists(titles, taglines, subscribers)
-    //console.log(list)
+    await goToShip("https://www.producthunt.com/upcoming?ref=header_nav", page)
+    await scrollDown(page, 20)
+    const itemClass = "[class*='styles_item']"
+    const ranking = await getItem(page, itemClass)
+    await preprocess(ranking)
     await browser.close()
+    return "200. Success"
   }
   catch (e) {
     console.log(e)
+    return "500. Internal Server Error"
   }
 
 }
@@ -129,9 +192,21 @@ const handler = async(event) => {
 
 if (require.main === module) {
   const assert = require("assert")
-  handler()
-    .then(x => x)
-    .catch(e => console.log(e))
+  const payload = require("./payload.json")
+
+  const testPreprocess = data =>
+    preprocess(data)
+
+  //const processed = preprocess(payload)
+
+  const testHandler = () => 
+    handler()
+      .then(x => console.log(x))
+      .catch(e => console.log(e))
+
+  testHandler()
+ 
+
   
   const testConvertSubscribers = s =>
     convertSubscribers(s)
