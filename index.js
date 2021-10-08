@@ -113,7 +113,7 @@ const saveJson = data => {
 }
 
 
-const addDate = xs => xs.map(x => ({...x, updateDate: new Date().toISOString()}))
+const addDate = xs => xs.map(x => ({...x, updateDate: new Date().toISOString().substring(0, 10)}))
 
 const removeNoTitle = data => data.filter(x => x.title)
 
